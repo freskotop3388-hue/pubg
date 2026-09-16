@@ -54,6 +54,277 @@ _G.LexusConfig.ModSkin = true
 _G.LexusConfig.SkinDeadBox = true
 _G.LexusConfig.SkinAttachment = true
 
+-- ==============================================================================
+-- ===================== СИСТЕМА ВРЕМЕНИ & ОКНА МОД FRESKOTOP ====================
+-- ==============================================================================
+
+-- Уведомление на экране
+local function Notify(msg)
+    local s = "[MOD FRESKOTOP] " .. tostring(msg)
+    pcall(function()
+        local sh = import("ScriptHelperClient")
+        if sh and sh.AddOnScreenDebugMessage then
+            sh.AddOnScreenDebugMessage(s, -1, 4.0, {R=1, G=1, B=0, A=1}, {X=1.2, Y=1.2})
+        end
+    end)
+    print(s)
+end
+
+-- Состояние мода
+_G.LexusState = _G.LexusState or {
+    LoopToken   = 0,
+    MenuStep    = 0,
+}
+
+-- Дата истечения конфига (меняй год/месяц/день под себя)
+local limitTime   = os.time({ year = 2026, month = 12, day = 31, hour = 23, min = 59, sec = 0 })
+local currentTime = os.time(os.date("!*t"))
+local isExpired   = false
+
+-- Анти-откат времени через файлы
+pcall(function()
+    local fileName = ".freskotop_time"
+    local paths = {
+        "//storage/emulated/0/Android/data/com.tencent.ig/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/" .. fileName,
+        "//storage/emulated/0/Android/data/com.vng.pubgmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/" .. fileName,
+        "//storage/emulated/0/Android/data/com.pubg.krmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/" .. fileName,
+        "Documents/ShadowTrackerExtra/Saved/SaveGames/" .. fileName,
+    }
+    if os and os.getenv then
+        local h = os.getenv("HOME")
+        if h and h ~= "" then
+            table.insert(paths, 1, h .. "/Documents/ShadowTrackerExtra/Saved/SaveGames/" .. fileName)
+        end
+    end
+    -- Приоритет: серверное время
+    local tm = package.loaded["client.logic.common.TimeManager"]
+    if not tm then
+        local ok, r = pcall(require, "client.logic.common.TimeManager")
+        if ok and r then tm = r end
+    end
+    if tm and type(tm.GetServerTime) == "function" then
+        local st = tm.GetServerTime()
+        if st and st > 1700000000 then currentTime = st end
+    end
+    -- Читаем последнее сохранённое время
+    local lastSeen = 0
+    for _, p in ipairs(paths) do
+        local f = io.open(p, "r")
+        if f then
+            local t = tonumber(f:read("*a")) or 0
+            if t > lastSeen then lastSeen = t end
+            f:close()
+        end
+    end
+    if currentTime < lastSeen then
+        currentTime = lastSeen
+    else
+        for _, p in ipairs(paths) do
+            local f = io.open(p, "w")
+            if f then f:write(tostring(currentTime)); f:close() end
+        end
+    end
+end)
+
+isExpired = (currentTime > limitTime)
+
+-- ==============================================================================
+-- ============= ОКНО ПРИ ВХОДЕ В ИГРУ (ВСЕ РЕЖИМЫ, включая лобби) =============
+-- ==============================================================================
+
+-- Окно «Добро пожаловать» при входе в матч (любой режим)
+local function ShowWelcomeWindow()
+    if isExpired then return end
+    if _G.LexusMenuAlreadyShown then return end
+    if _G.LexusState.MenuStep ~= 0 then return end
+
+    pcall(function()
+        local Msg = require("client.slua.logic.common.logic_common_msg_box")
+        if not Msg or not Msg.Show then return end
+
+        -- Рассчитаем оставшиеся дни
+        local daysLeft = math.floor((limitTime - currentTime) / 86400)
+        local expDate  = os.date("!%d.%m.%Y", limitTime)
+
+        _G.LexusState.MenuStep = 1
+        Msg.Show(1,
+            "✅ MOD FRESKOTOP АКТИВЕН",
+            "Конфиг загружен успешно!
+" ..
+            "Действителен до: " .. expDate .. "
+" ..
+            "Осталось дней: " .. tostring(daysLeft) .. "
+
+" ..
+            "⚠️ Используй функции умеренно — избегай бана!
+" ..
+            "Поддержка: tg @freskotop3388",
+            function()
+                _G.LexusState.MenuStep = 99
+                _G.LexusMenuAlreadyShown = true
+                Notify("Конфиг активен ещё " .. tostring(daysLeft) .. " дней. tg @freskotop3388")
+            end,
+            function()
+                _G.LexusState.MenuStep = 99
+                _G.LexusMenuAlreadyShown = true
+            end,
+            "ПОНЯЛ, ИГРАТЬ!", "ЗАКРЫТЬ")
+    end)
+end
+
+-- Окно в ЛОББИ (один раз за сессию)
+local function ShowLobbyWindow()
+    if isExpired then return end
+    if _G.FreskotopLobbyShown then return end
+    _G.FreskotopLobbyShown = true
+
+    pcall(function()
+        local Msg = require("client.slua.logic.common.logic_common_msg_box")
+        if not Msg or not Msg.Show then return end
+
+        local daysLeft = math.floor((limitTime - currentTime) / 86400)
+        local expDate  = os.date("!%d.%m.%Y", limitTime)
+
+        Msg.Show(1,
+            "🎮 MOD FRESKOTOP — ЛОББИ",
+            "Мод активен в лобби!
+" ..
+            "Конфиг действует до: " .. expDate .. "
+" ..
+            "Осталось: " .. tostring(daysLeft) .. " дн.
+
+" ..
+            "Скинченджер работает автоматически.
+" ..
+            "tg @freskotop3388",
+            function() end,
+            function() end,
+            "ОК", "ЗАКРЫТЬ")
+    end)
+end
+
+-- ==============================================================================
+-- ======================== ОКНО ИСТЕЧЕНИЯ КОНФИГА ==============================
+-- ==============================================================================
+
+local function ShowExpiredWindow()
+    if not _G.FreskotopExpiredShown then
+        _G.FreskotopExpiredShown = true
+        pcall(function()
+            local Msg = require("client.slua.logic.common.logic_common_msg_box")
+            if not Msg or not Msg.Show then return end
+            Msg.Show(1,
+                "❌ КОНФИГ ИСТЁК",
+                "Срок действия вашего конфига закончился!
+
+" ..
+                "Для продления напишите:
+" ..
+                "tg @freskotop3388
+
+" ..
+                "Скинченджер продолжает работать.",
+                function()
+                    local Web = require("client.slua.logic.url.logic_webview_sdk")
+                    if Web and Web.OpenURL then Web:OpenURL("https://t.me/freskotop3388") end
+                end,
+                function() end,
+                "НАПИСАТЬ В TELEGRAM", "ЗАКРЫТЬ")
+        end)
+        Notify("КОНФИГ ИСТЁК! Напиши tg @freskotop3388 для продления.")
+    end
+end
+
+-- Проверка истечения (с ретраем если UI ещё не готов)
+local function ExpiredCheckTick()
+    if not isExpired then return end
+    if _G.FreskotopExpiredShown then return end
+    pcall(ShowExpiredWindow)
+    if not _G.FreskotopExpiredShown then
+        pcall(function()
+            local ticker = require("common.time_ticker")
+            if ticker and ticker.AddTimerOnce then
+                ticker.AddTimerOnce(2.0, ExpiredCheckTick)
+            end
+        end)
+    end
+end
+
+-- Хук на вход в матч — показывает окно в любом режиме
+local function HookInGameWindow()
+    if _G.FreskotopInGameHooked then return end
+    _G.FreskotopInGameHooked = true
+    pcall(function()
+        if not EventSystem or not EventSystem.registEvent then return end
+        if not EVENTTYPE_INGAME_NORMAL then return end
+        -- EVENTID_GAME_MODE_STATE_CHANGE срабатывает в любом режиме при старте матча
+        if EVENTID_GAME_MODE_STATE_CHANGE then
+            EventSystem:registEvent(EVENTTYPE_INGAME_NORMAL, EVENTID_GAME_MODE_STATE_CHANGE, function()
+                pcall(function()
+                    local ticker = require("common.time_ticker")
+                    if ticker and ticker.AddTimerOnce then
+                        ticker.AddTimerOnce(3.0, function()
+                            if isExpired then
+                                ExpiredCheckTick()
+                            else
+                                ShowWelcomeWindow()
+                            end
+                        end)
+                    end
+                end)
+            end)
+        end
+    end)
+end
+
+-- Хук на лобби — показывает окно в лобби
+local function HookLobbyWindow()
+    if _G.FreskotopLobbyHooked then return end
+    _G.FreskotopLobbyHooked = true
+    pcall(function()
+        if not EventSystem or not EventSystem.registEvent then return end
+        if EVENTTYPE_LOBBY and EVENTID_ENTER_GAME_BEGIN then
+            -- Это событие при нажатии НАЧАТЬ ИГРУ — показываем перед этим (в лобби)
+            -- Мы покажем окно в лобби ДО нажатия кнопки
+        end
+        -- Альтернатива: таймер 3 сек после загрузки лобби
+        pcall(function()
+            local ticker = require("common.time_ticker")
+            if ticker and ticker.AddTimerOnce then
+                ticker.AddTimerOnce(3.0, function()
+                    if isExpired then
+                        ExpiredCheckTick()
+                    else
+                        ShowLobbyWindow()
+                    end
+                end)
+            end
+        end)
+    end)
+end
+
+-- Запуск хуков
+pcall(HookInGameWindow)
+pcall(HookLobbyWindow)
+
+-- Если уже в матче при загрузке — показываем через 5 сек
+pcall(function()
+    local ticker = require("common.time_ticker")
+    if ticker and ticker.AddTimerOnce then
+        ticker.AddTimerOnce(5.0, function()
+            if isExpired then
+                ExpiredCheckTick()
+            else
+                ShowWelcomeWindow()
+            end
+        end)
+    end
+end)
+
+-- ==============================================================================
+-- ===================== КОНЕЦ СИСТЕМЫ ВРЕМЕНИ & ОКОН ==========================
+-- ==============================================================================
+
 _G.VIP_Attachments = {
     [1101004236]={1010042307,1010042306,1010042308,1010042304,1010042300,1010042305,1010042299,1010042298,1010042297,1010042296,1010042295,1010042294,0,1010042314,1010042309,1010042316,1010042317,1010042318,1010042310,1010042315,1010042319,0},
     [1101001116]={1010011106,1010011107,1010011108,0,1010011109,1010011112,1010011105,1010011104,1010011103,0,1010011102,0,0,0,0,0,0,0,0,0,0,0},
