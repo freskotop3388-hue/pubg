@@ -6604,6 +6604,7 @@ function F.setMakeSkinAtIndex(comp, applyIdx, resID, slotID)
                 F.ensureSkinDownload(resID)
                 equipment.ItemId = resID
                 if equipment.ItemID ~= nil then equipment.ItemID = resID end
+                if equipment.FakeItemID ~= nil then equipment.FakeItemID = resID end
                 applyData:Set(applyIdx, equipment)
                 changed = true
             end
@@ -6616,6 +6617,7 @@ function F.applySlotSkinBatch(comp, entries, opts)
     opts = opts or {}
     if not comp or not slua.isValid(comp) or not entries then return false end
     local changed, anyOk = false, false
+    local missingSlots = {}
     pcall(function()
         local net = comp.NetAvatarData
         if not net then return end
@@ -6626,15 +6628,23 @@ function F.applySlotSkinBatch(comp, entries, opts)
             local itemId, slotId = tonumber(e[1]), tonumber(e[2])
             if itemId and itemId > 0 and slotId then
                 F.ensureSkinDownload(itemId)
+                local found = false
                 for i = 0, num - 1 do
                     local equipment = applyData:Get(i)
                     if equipment and equipment.SlotID == slotId then
+                        found = true
                         local cur = tonumber(equipment.ItemId) or tonumber(equipment.ItemID) or 0
                         if cur == itemId then
+                            if equipment.FakeItemID ~= nil and tonumber(equipment.FakeItemID) ~= itemId then
+                                equipment.FakeItemID = itemId
+                                applyData:Set(i, equipment)
+                                changed = true
+                            end
                             anyOk = true
                         elseif cur ~= itemId then
                             equipment.ItemId = itemId
                             if equipment.ItemID ~= nil then equipment.ItemID = itemId end
+                            if equipment.FakeItemID ~= nil then equipment.FakeItemID = itemId end
                             applyData:Set(i, equipment)
                             changed = true
                             anyOk = true
@@ -6642,12 +6652,22 @@ function F.applySlotSkinBatch(comp, entries, opts)
                         break
                     end
                 end
+                if not found then
+                    missingSlots[#missingSlots + 1] = { itemId, slotId }
+                end
             end
         end
         if (changed or opts.forceRep) and comp.OnRep_BodySlotStateChanged then
             comp:OnRep_BodySlotStateChanged()
         end
     end)
+    for _, ms in ipairs(missingSlots) do
+        local itemId = ms[1]
+        if comp.PutOnCustomEquipmentByID then
+            pcall(function() comp:PutOnCustomEquipmentByID(itemId) end)
+            anyOk = true
+        end
+    end
     return anyOk or changed
 end
 
@@ -6668,11 +6688,17 @@ function F.setMakeSkin(comp, resID, slotID, opts)
             if equipment and equipment.SlotID == slotID then
                 local cur = tonumber(equipment.ItemId) or tonumber(equipment.ItemID) or 0
                 if cur == resID then
+                    if equipment.FakeItemID ~= nil and tonumber(equipment.FakeItemID) ~= resID then
+                        equipment.FakeItemID = resID
+                        applyData:Set(i, equipment)
+                        changed = true
+                    end
                     already = true
                 elseif cur ~= resID then
                     F.ensureSkinDownload(resID)
                     equipment.ItemId = resID
                     if equipment.ItemID ~= nil then equipment.ItemID = resID end
+                    if equipment.FakeItemID ~= nil then equipment.FakeItemID = resID end
                     applyData:Set(i, equipment)
                     changed = true
                 end
@@ -7063,6 +7089,93 @@ function F.matchApplyAllSlots(char)
     end
 
     return ok or #entries == 0
+end
+
+-- [FIX] Непрерывное применение outfit-скинов во время матча.
+-- Движок PUBG Mobile может перезаписать SlotSyncData при подборе предметов,
+-- респавне, открытии инвентаря и т.д. Без FakeItemID сервер сбрасывает
+-- клиентский визуал. Вотчер пере-применяет скины каждые ~2 сек.
+local _outfitReapplyTimer = nil
+
+function F.reapplyOutfitSkins(char)
+    if not char or not slua.isValid(char) then return false end
+    if not F.isInRealMatch() then return false end
+    local comp = F.getAvatarComp2(char)
+    if not comp then return false end
+
+    F.syncGlobalWearSkins()
+
+    local anyChanged = false
+    pcall(function()
+        local net = comp.NetAvatarData
+        if not net then return end
+        local applyData = net.SlotSyncData
+        if not applyData or not slua.isValid(applyData) then return end
+        local num = applyData:Num()
+
+        local function reapplySlot(targetRes, slotID)
+            if not targetRes or targetRes <= 0 then return end
+            for i = 0, num - 1 do
+                local equipment = applyData:Get(i)
+                if equipment and equipment.SlotID == slotID then
+                    local cur = tonumber(equipment.ItemId) or tonumber(equipment.ItemID) or 0
+                    if cur ~= targetRes then
+                        F.ensureSkinDownload(targetRes)
+                        equipment.ItemId = targetRes
+                        if equipment.ItemID ~= nil then equipment.ItemID = targetRes end
+                        if equipment.FakeItemID ~= nil then equipment.FakeItemID = targetRes end
+                        applyData:Set(i, equipment)
+                        anyChanged = true
+                    else
+                        if equipment.FakeItemID ~= nil and tonumber(equipment.FakeItemID) ~= targetRes then
+                            equipment.FakeItemID = targetRes
+                            applyData:Set(i, equipment)
+                            anyChanged = true
+                        end
+                    end
+                    return
+                end
+            end
+        end
+
+        reapplySlot(_G.HatSkin,        F.CUST_SLOT.HatEquipemtSlot)
+        reapplySlot(_G.SuitSkin,       F.CUST_SLOT.ClothesEquipemtSlot)
+        reapplySlot(_G.PantsSkin,      F.CUST_SLOT.PantsEquipemtSlot)
+        reapplySlot(_G.ShoesSkin,      F.CUST_SLOT.ShoesEquipemtSlot)
+        reapplySlot(_G.GlovesSkin,     F.CUST_SLOT.HandEffectEquipemtSlot)
+        reapplySlot(_G.MaskSkin,       F.CUST_SLOT.FaceEquipemtSlot)
+        reapplySlot(_G.GlassSkin,      F.CUST_SLOT.GlassEquipemtSlot)
+    end)
+
+    if anyChanged and comp.OnRep_BodySlotStateChanged then
+        pcall(function() comp:OnRep_BodySlotStateChanged() end)
+    end
+    return anyChanged
+end
+
+function F.startOutfitReapplyWatcher(char)
+    if _outfitReapplyTimer then return end
+    if not char or not slua.isValid(char) then return end
+    local elapsed = 0
+    local MAX_SEC = 300 -- 5 минут, покрывает весь матч
+    _outfitReapplyTimer = char:AddGameTimer(2.0, true, function()
+        elapsed = elapsed + 2.0
+        local cur = F.getLocalChar()
+        if not cur or not slua.isValid(cur) then
+            if _outfitReapplyTimer and char.RemoveGameTimer then
+                pcall(function() char:RemoveGameTimer(_outfitReapplyTimer) end)
+            end
+            _outfitReapplyTimer = nil
+            return
+        end
+        F.reapplyOutfitSkins(cur)
+        if elapsed >= MAX_SEC then
+            if _outfitReapplyTimer and cur.RemoveGameTimer then
+                pcall(function() cur:RemoveGameTimer(_outfitReapplyTimer) end)
+            end
+            _outfitReapplyTimer = nil
+        end
+    end)
 end
 
 function F.matchApplyHat(char)
@@ -7636,6 +7749,9 @@ function F.startMatchWatcher(char)
     _lastWeaponResID = 0
     local elapsed = 0
 
+    -- [FIX] Запускаем непрерывный вотчер outfit-скинов
+    F.startOutfitReapplyWatcher(char)
+
     _matchTimer = char:AddGameTimer(MATCH_TICK_SEC, true, function()
         elapsed = elapsed + MATCH_TICK_SEC
         local cur = F.getLocalChar()
@@ -7673,6 +7789,13 @@ function F.stopMatchWatcher()
             if char and char.RemoveGameTimer then char:RemoveGameTimer(_matchTimer) end
         end)
         _matchTimer = nil
+    end
+    if _outfitReapplyTimer then
+        pcall(function()
+            local char = F.getLocalChar()
+            if char and char.RemoveGameTimer then char:RemoveGameTimer(_outfitReapplyTimer) end
+        end)
+        _outfitReapplyTimer = nil
     end
     PERF.matchActive = false
     PERF.wearDoneThisMatch = false
