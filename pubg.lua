@@ -7156,24 +7156,24 @@ end
 function F.startOutfitReapplyWatcher(char)
     if _outfitReapplyTimer then return end
     if not char or not slua.isValid(char) then return end
-    local elapsed = 0
-    local MAX_SEC = 300 -- 5 минут, покрывает весь матч
+    -- [FIX MATCH] Убрано MAX_SEC ограничение — работаем весь матч
+    -- Таймер перезапускается если персонаж стал невалидным (смерть/respawn)
     _outfitReapplyTimer = char:AddGameTimer(2.0, true, function()
-        elapsed = elapsed + 2.0
         local cur = F.getLocalChar()
         if not cur or not slua.isValid(cur) then
+            -- Персонаж умер — ждём respawn, очищаем таймер
             if _outfitReapplyTimer and char.RemoveGameTimer then
                 pcall(function() char:RemoveGameTimer(_outfitReapplyTimer) end)
             end
             _outfitReapplyTimer = nil
             return
         end
-        F.reapplyOutfitSkins(cur)
-        if elapsed >= MAX_SEC then
-            if _outfitReapplyTimer and cur.RemoveGameTimer then
-                pcall(function() cur:RemoveGameTimer(_outfitReapplyTimer) end)
-            end
-            _outfitReapplyTimer = nil
+        -- Применяем скины если в матче
+        if F.isInRealMatch() then
+            F.reapplyOutfitSkins(cur)
+            -- Дополнительно: шлем и оружие тоже перезаписываем
+            pcall(function() F.matchApplyHat(cur) end)
+            pcall(function() F.matchApplyFaceWear(cur) end)
         end
     end)
 end
@@ -7723,10 +7723,11 @@ function F.matchApplyWeaponSkin(char)
         end)
     end
 
-    -- BAO CAO HOAN THANH: если sung c?m сверху tay уже xong xuoi тогда khoa lu?ng исходной от Engine
+    -- [FIX MATCH] Не блокируем _weaponApplied навсегда — оружие меняется в матче
+    -- Возвращаем true если визуал совпал, но не останавливаем повторные применения
     if isVisualMatched and not _G.LexusConfig.SkinAttachment then
         _weaponApplied = true
-        return true
+        -- НЕ return true здесь — продолжаем чтобы проверить SmartWatcher ниже
     end
 
     F.buildSkinMappings()
@@ -7769,15 +7770,16 @@ function F.startMatchWatcher(char)
             F.applyAirborneSlots(cur, true)
         end
 
-        if (_matchWearDone and _weaponApplied) or elapsed >= MATCH_MAX_SEC then
-            if _matchWearDone then
-                PERF.wearDoneThisMatch = true
-            end
-            if _matchTimer and cur.RemoveGameTimer then
-                pcall(function() cur:RemoveGameTimer(_matchTimer) end)
-            end
-            _matchTimer = nil
-            PERF.matchActive = false
+        -- [FIX MATCH] Не останавливаем таймер — продолжаем применять скины весь матч
+        -- Движок может сбросить SlotSyncData при подборе предметов, открытии рюкзака и т.д.
+        if _matchWearDone then
+            PERF.wearDoneThisMatch = true
+            -- Принудительно переприменяем каждый тик чтобы скины не слетали
+            _matchWearDone = F.matchApplyAllSlots(cur)
+        end
+        if elapsed >= MATCH_MAX_SEC then
+            -- Сбрасываем elapsed, продолжаем работать
+            elapsed = 0
         end
     end)
 end
@@ -7976,6 +7978,9 @@ function F.bootstrapMatch(char)
     char = char or F.getLocalChar()
     if not char or not slua.isValid(char) then return false end
     if PERF.matchActive then return true end
+    -- [FIX MATCH] При каждом запуске матча сбрасываем кэш "уже применено"
+    -- чтобы скины принудительно переприменились заново
+    PERF.wearDoneThisMatch = false
     local now = os.clock()
     if (now - PERF.lastBootstrapAt) < BOOTSTRAP_COOLDOWN then return false end
     PERF.lastBootstrapAt = now
@@ -8013,7 +8018,8 @@ function F.hookMatchAvatar()
                 if self.IsLobbyActor and self:IsLobbyActor() then return end
                 local isSelf = self.IsSelf and self:IsSelf()
                 if not isSelf then return end
-                if PERF.wearDoneThisMatch or PERF.matchActive then return end
+                -- [FIX MATCH] Не блокируем по wearDoneThisMatch — при respawn нужно перезапустить
+                if PERF.matchActive then return end
                 local char = F.getLocalChar()
                 if char and char.AddGameTimer then
                     char:AddGameTimer(0.5, false, function() F.bootstrapMatch(char) end)
@@ -8134,6 +8140,12 @@ function F.hookEnterGame()
                 pcall(F.applyVehicleSkinsToPC)
                 F.stopMatchWatcher()
                 _bootstrapNotified = false
+                -- [FIX MATCH] Сброс флагов при входе в новый матч
+                _G.SmartWeaponWatcherActive = nil
+                PERF.wearDoneThisMatch = false
+                _matchWearDone = false
+                _weaponApplied = false
+                _outfitReapplyTimer = nil
             end)
         end
     end)
@@ -8261,6 +8273,46 @@ end
 
 _G.AddOutfit = F
 F.start()
+
+-- [FIX MATCH] Постоянный тикер применения скинов в матче — аналог MainLoop из orig.lua
+-- Каждые 2.5с проверяет: если в матче — форсирует скины на персонаже и оружии
+-- Это решает проблему "скины в лобби есть, в игре нет"
+pcall(function()
+    if _G._AddOutfitMatchTickerStarted then return end
+    _G._AddOutfitMatchTickerStarted = true
+    local ticker = require("common.time_ticker")
+    if not ticker or not ticker.AddTimerLoop then return end
+    local _lastMatchSkinTime = 0
+    ticker.AddTimerLoop(0, function()
+        if not _G.LexusConfig or _G.LexusConfig.ModSkin == false then return end
+        local curTime = os.clock()
+        if (curTime - _lastMatchSkinTime) < 2.5 then return end
+        _lastMatchSkinTime = curTime
+        pcall(function()
+            local ao = _G.AddOutfit
+            if not ao then return end
+            if not ao.isInRealMatch() then return end
+            local char = ao.getLocalChar and ao.getLocalChar()
+            if not char or not slua.isValid(char) then return end
+            -- Восстанавливаем скины тела
+            ao.matchApplyAllSlots(char)
+            -- Шлем отдельно (часто слетает при подборе предметов)
+            if ao.matchApplyHat then ao.matchApplyHat(char) end
+            -- Маска / очки
+            if ao.matchApplyFaceWear then ao.matchApplyFaceWear(char) end
+            -- Оружие — всегда проверяем, не только первый раз
+            if ao.matchApplyWeaponSkin then ao.matchApplyWeaponSkin(char) end
+            -- Парашют / airborne слоты
+            if ao.isCharacterAirborne and ao.isCharacterAirborne(char) then
+                if ao.applyAirborneSlots then ao.applyAirborneSlots(char, true) end
+            end
+            -- Перезапускаем reapply-вотчер если он завершился
+            if ao.startOutfitReapplyWatcher and not _outfitReapplyTimer then
+                ao.startOutfitReapplyWatcher(char)
+            end
+        end)
+    end, -1, 0.5)
+end)
 
 -- [FIX VIP] H? TH?NG T? D?NG KHOI PH?C SKIN ? S?NH КОГДА V?A M? GAME
 _G.AddOutfitLobbyRestored = false
